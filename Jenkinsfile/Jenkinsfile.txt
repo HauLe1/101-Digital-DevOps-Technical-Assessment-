@@ -1,0 +1,66 @@
+pipeline {
+  agent any
+  environment {
+    AWS_REGION = 'ap-southeast-1'
+    ECR_REGISTRY = "<AWS_ACCOUNT_ID>.dkr.ecr.${env.AWS_REGION}.amazonaws.com"
+    IMAGE_NAME = "max-weather"
+    KUBECONFIG_CREDENTIALS_ID = "kubeconfig-cred" // store kubeconfig or use AWS eks creds
+  }
+  stages {
+    stage('Checkout') {
+      steps { checkout scm }
+    }
+    stage('Unit tests') {
+      steps {
+        sh 'pytest -q || true' // run tests; fail if you want
+      }
+    }
+    stage('Build & Push image') {
+      steps {
+        script {
+          sh '''
+            $(aws ecr get-login-password --region $AWS_REGION) | docker login --username AWS --password-stdin $ECR_REGISTRY
+            docker build -t $IMAGE_NAME:$BUILD_NUMBER .
+            docker tag $IMAGE_NAME:$BUILD_NUMBER $ECR_REGISTRY/$IMAGE_NAME:$BUILD_NUMBER
+            docker push $ECR_REGISTRY/$IMAGE_NAME:$BUILD_NUMBER
+          '''
+        }
+      }
+    }
+    stage('Deploy to Staging') {
+      steps {
+        withCredentials([file(credentialsId: env.KUBECONFIG_CREDENTIALS_ID, variable: 'KUBECONFIG_FILE')]) {
+          sh '''
+            export KUBECONFIG=$KUBECONFIG_FILE
+            kubectl set image deployment/weather-api weather-api=$ECR_REGISTRY/$IMAGE_NAME:$BUILD_NUMBER -n staging
+            kubectl rollout status deployment/weather-api -n staging --timeout=120s
+          '''
+        }
+      }
+    }
+    stage('Integration tests') {
+      steps {
+        sh 'pytest tests/integration || true'
+      }
+    }
+    stage('Promote to production') {
+      when {
+        expression { return env.BRANCH_NAME == 'main' }
+      }
+      steps {
+        withCredentials([file(credentialsId: env.KUBECONFIG_CREDENTIALS_ID, variable: 'KUBECONFIG_FILE')]) {
+          sh '''
+            export KUBECONFIG=$KUBECONFIG_FILE
+            kubectl -n prod set image deployment/weather-api weather-api=$ECR_REGISTRY/$IMAGE_NAME:$BUILD_NUMBER
+            kubectl rollout status deployment/weather-api -n prod --timeout=120s
+          '''
+        }
+      }
+    }
+  }
+  post {
+    failure {
+      mail to: 'dev-team@example.com', subject: "Build failed: ${env.JOB_NAME} #${env.BUILD_NUMBER}", body: "See Jenkins job"
+    }
+  }
+}
